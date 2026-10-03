@@ -24,6 +24,7 @@ import (
 	flag "github.com/spf13/pflag"
 	"helm.sh/helm/v4/pkg/getter"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -95,27 +96,28 @@ func main() {
 	)
 
 	var (
-		metricsAddr            string
-		eventsAddr             string
-		healthAddr             string
-		concurrent             int
-		requeueDependency      time.Duration
-		helmIndexLimit         int64
-		helmChartLimit         int64
-		helmChartFileLimit     int64
-		artifactOptions        artcfg.Options
-		clientOptions          client.Options
-		logOptions             logger.Options
-		leaderElectionOptions  leaderelection.Options
-		rateLimiterOptions     helper.RateLimiterOptions
-		featureGates           feathelper.FeatureGates
-		watchOptions           helper.WatchOptions
-		intervalJitterOptions  jitter.IntervalOptions
-		helmCacheMaxSize       int
-		helmCacheTTL           string
-		helmCachePurgeInterval string
-		tokenCacheOptions      pkgcache.TokenFlags
-		defaultServiceAccount  string
+		metricsAddr             string
+		eventsAddr              string
+		healthAddr              string
+		concurrent              int
+		requeueDependency       time.Duration
+		helmIndexLimit          int64
+		helmChartLimit          int64
+		helmChartFileLimit      int64
+		artifactOptions         artcfg.Options
+		clientOptions           client.Options
+		logOptions              logger.Options
+		leaderElectionOptions   leaderelection.Options
+		rateLimiterOptions      helper.RateLimiterOptions
+		featureGates            feathelper.FeatureGates
+		watchOptions            helper.WatchOptions
+		intervalJitterOptions   jitter.IntervalOptions
+		helmCacheMaxSize        int
+		helmCacheTTL            string
+		helmCachePurgeInterval  string
+		tokenCacheOptions       pkgcache.TokenFlags
+		defaultServiceAccount   string
+		shardArtifactGCInterval time.Duration
 	)
 
 	flag.StringVar(&metricsAddr, "metrics-addr", envOrDefault("METRICS_ADDR", ":8080"),
@@ -144,6 +146,8 @@ func main() {
 		"The list of hostkey algorithms to use for ssh connections, arranged from most preferred to the least.")
 	flag.StringVar(&defaultServiceAccount, auth.ControllerFlagDefaultServiceAccount,
 		"", "Default service account to use for workload identity when not specified in resources.")
+	flag.DurationVar(&shardArtifactGCInterval, "shard-artifact-gc-interval", 10*time.Minute,
+		"The interval at which artifacts of objects that left the shard are garbage collected. Only applies when --watch-label-selector is set, 0 disables it.")
 
 	artifactOptions.BindFlags(flag.CommandLine)
 	clientOptions.BindFlags(flag.CommandLine)
@@ -188,7 +192,7 @@ func main() {
 
 	CosignVerifierFactory := scosign.NewCosignVerifierFactory()
 
-	mgr := mustSetupManager(metricsAddr, healthAddr, concurrent, watchOptions, clientOptions, leaderElectionOptions)
+	mgr, watchSelector, watchNamespace := mustSetupManager(metricsAddr, healthAddr, concurrent, watchOptions, clientOptions, leaderElectionOptions)
 
 	probes.SetupChecks(mgr, setupLog)
 
@@ -312,6 +316,23 @@ func main() {
 	}
 	// +kubebuilder:scaffold:builder
 
+	// Garbage-collect the stored artifacts of objects that left the shard.
+	// Without a watch label selector every object is owned and there is
+	// nothing to collect.
+	if watchOptions.LabelSelector != "" && shardArtifactGCInterval > 0 {
+		if err := mgr.Add(&controller.ShardArtifactGC{
+			Storage:   storage,
+			APIReader: mgr.GetAPIReader(),
+			Selector:  watchSelector,
+			Namespace: watchNamespace,
+			Interval:  shardArtifactGCInterval,
+			Log:       ctrl.Log.WithName("shard-artifact-gc"),
+		}); err != nil {
+			setupLog.Error(err, "unable to add shard artifact garbage collector")
+			os.Exit(1)
+		}
+	}
+
 	go func() {
 		// Block until our controller manager is elected leader. We presume our
 		// entire process will terminate if we lose leadership, so we don't need
@@ -333,7 +354,7 @@ func main() {
 }
 
 func mustSetupManager(metricsAddr, healthAddr string, maxConcurrent int,
-	watchOpts helper.WatchOptions, clientOpts client.Options, leaderOpts leaderelection.Options) ctrl.Manager {
+	watchOpts helper.WatchOptions, clientOpts client.Options, leaderOpts leaderelection.Options) (ctrl.Manager, labels.Selector, string) {
 
 	watchNamespace := ""
 	if !watchOpts.AllNamespaces {
@@ -407,7 +428,7 @@ func mustSetupManager(metricsAddr, healthAddr string, maxConcurrent int,
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
-	return mgr
+	return mgr, watchSelector, watchNamespace
 }
 
 func mustSetupHelmLimits(indexLimit, chartLimit, chartFileLimit int64) {
